@@ -7,7 +7,12 @@ import re
 import shutil
 import time
 from uuid import uuid4
-from lightrag.utils import logger, get_pinyin_sort_key, performance_timing_log
+from lightrag.utils import (
+    logger,
+    get_pinyin_sort_key,
+    performance_timing_log,
+    validate_workspace,
+)
 import aiofiles
 import traceback
 from datetime import datetime, timezone
@@ -39,9 +44,11 @@ from lightrag.parser.routing import (
     FilenameParserHintError,
     canonicalize_parser_hinted_basename,
     chunk_strategy_key,
+    encode_parse_engine,
     filename_parser_hint,
+    parse_process_options,
     resolve_chunk_options,
-    resolve_file_parser_directives,
+    resolve_parser_directives,
 )
 from lightrag.utils import (
     generate_track_id,
@@ -288,7 +295,11 @@ class RecursiveCharacterChunkParams(_OverlapChunkParams):
 
 
 class ParagraphSemanticChunkParams(_OverlapChunkParams):
-    pass
+    # Drop the trailing reference section before chunking. ``None`` means
+    # "not supplied — inherit the addon_params/env default at process time".
+    # Detection-tuning knobs (tail window / heading prefixes) are env-only and
+    # read live by the chunker, so they are intentionally not exposed here.
+    drop_references: Optional[bool] = None
 
 
 class SemanticVectorChunkParams(_StrictChunkParams):
@@ -969,6 +980,8 @@ class DocumentManager:
         input_dir: str,
         workspace: str = "",  # New parameter for workspace isolation
     ):
+        # Reject path traversal before using workspace in the upload path
+        validate_workspace(workspace)
         # Store the base input directory and workspace
         self.base_input_dir = Path(input_dir)
         self.workspace = workspace
@@ -1606,9 +1619,7 @@ async def pipeline_enqueue_file(
             file_size = 0
 
         try:
-            extraction_engine, process_options = resolve_file_parser_directives(
-                file_path
-            )
+            directives = resolve_parser_directives(file_path)
         except FilenameParserHintError as e:
             error_files = [
                 {
@@ -1625,20 +1636,64 @@ async def pipeline_enqueue_file(
             )
             return False, track_id
 
+        extraction_engine = directives.engine
+        process_options = directives.process_options
         api_process_options = process_options or PROCESS_OPTION_CHUNK_FIXED
+
+        # Overlay any per-file chunk parameters (from the filename hint or a
+        # LIGHTRAG_PARSER rule) onto the active strategy's chunk_options so the
+        # parse worker chunks this document with them. Absent params keep the
+        # legacy path (chunk_options built at enqueue time from addon_params).
+        hint_chunk_options = None
+        active_strategy = parse_process_options(api_process_options).chunking
+        hint_chunk_params = directives.chunk_params.get(active_strategy)
+        if hint_chunk_params:
+            try:
+                strategy_key = chunk_strategy_key(api_process_options)
+                hint_chunk_options = resolve_chunk_options(
+                    rag.addon_params, process_options=api_process_options
+                )
+                hint_chunk_options[strategy_key].update(hint_chunk_params)
+                _validate_effective_chunk_overlap(
+                    hint_chunk_options, strategy_key, strategy_key
+                )
+            except ValueError as e:
+                error_files = [
+                    {
+                        "file_path": str(file_path.name),
+                        "error_description": FILE_EXTRACTION_SUMMARY_PREFIX
+                        + "Chunk parameter error",
+                        "original_error": str(e),
+                        "file_size": file_size,
+                    }
+                ]
+                await rag.apipeline_enqueue_error_documents(error_files, track_id)
+                logger.error(
+                    f"[File Extraction]Invalid chunk parameters in "
+                    f"{file_path.name}: {e}"
+                )
+                return False, track_id
         # All engines defer parsing to the worker stage: the file is already
         # saved on disk, so we enqueue PENDING_PARSE with the chosen engine.
         # Legacy now extracts at the worker (LegacyParser) instead of eagerly
         # here, so every engine shares one ingestion path.
+        # Encode any per-file engine params into the parse_engine field
+        # (e.g. "mineru(page_range=1-3,language=en)") so they ride the existing
+        # persisted column to the parse worker. Bare engine when there are none.
+        parse_engine_field = encode_parse_engine(
+            extraction_engine, directives.engine_params
+        )
         try:
             enqueue_kwargs = {
                 "file_paths": str(file_path),
                 "track_id": track_id,
                 "docs_format": FULL_DOCS_FORMAT_PENDING_PARSE,
-                "parse_engine": extraction_engine,
+                "parse_engine": parse_engine_field,
                 "process_options": api_process_options,
                 "from_scan": from_scan,
             }
+            if hint_chunk_options is not None:
+                enqueue_kwargs["chunk_options"] = hint_chunk_options
             enqueue_result = await rag.apipeline_enqueue_documents("", **enqueue_kwargs)
             if enqueue_result is None:
                 try:
@@ -2046,7 +2101,7 @@ async def run_scanning_process(
                 ):
                     # File is already PROCESSED, skip it with warning and archive it.
                     processed_files.append(filename)
-                    warning = f"Skipping already processed file: " f"{filename}"
+                    warning = f"Skipping already processed file: {filename}"
                     await record_scan_warning(rag, warning)
                     try:
                         await move_file_to_parsed_dir(file_path)
@@ -3097,6 +3152,18 @@ def create_document_routes(
                 storage_name = storages[i].__class__.__name__
                 if isinstance(result, Exception):
                     error_msg = f"Error dropping {storage_name}: {str(result)}"
+                    errors.append(error_msg)
+                    logger.error(error_msg)
+                    storage_error_count += 1
+                elif isinstance(result, dict) and result.get("status") != "success":
+                    # drop() reports a non-raising failure as {"status": "error"}
+                    # (e.g. a backend that could not safely clear a kept legacy
+                    # store). Honor it so the clear is not counted as successful
+                    # while stale data remains and could be re-migrated/resurface.
+                    error_msg = (
+                        f"Error dropping {storage_name}: "
+                        f"{result.get('message', 'unknown error')}"
+                    )
                     errors.append(error_msg)
                     logger.error(error_msg)
                     storage_error_count += 1

@@ -136,9 +136,7 @@ def _print_summary(blocks_path: Path, raw_dir: Path | None, preview: int) -> Non
             heading = row.get("heading") or ""
             content = (row.get("content") or "").replace("\n", " ")
             snippet = content if len(content) <= 80 else content[:77] + "..."
-            print(
-                f"  [{row.get('blockid', '')[:8]}] " f"heading={heading!r} :: {snippet}"
-            )
+            print(f"  [{row.get('blockid', '')[:8]}] heading={heading!r} :: {snippet}")
 
 
 def _print_raw_summary(result: dict, preview: int) -> None:
@@ -215,7 +213,11 @@ async def _run(args: argparse.Namespace) -> int:
         # and the source file sit side by side.
         return parsed_dir
 
-    def _lenient_bundle(raw_dir_arg: Path, _source_file: Path) -> bool:
+    def _lenient_bundle(
+        raw_dir_arg: Path, _source_file: Path | None = None, *_args: Any, **_kwargs: Any
+    ) -> bool:
+        # Tolerate the ExternalParserBase hook's keyword-only ``engine_params``
+        # (and any future args) — this stub replaces ``is_bundle_valid``.
         return raw_dir_arg.exists() and any(raw_dir_arg.iterdir())
 
     def _force_miss(*_args: Any, **_kwargs: Any) -> bool:
